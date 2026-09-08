@@ -16,10 +16,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-CLASS_NAMES = ["pothole", "pothole_deep", "manhole"]
-POTHOLE, POTHOLE_DEEP, MANHOLE = 0, 1, 2
+CLASS_NAMES = ["pothole", "manhole"]
+POTHOLE, MANHOLE = 0, 1
 
-RDD_REMAP = {6: POTHOLE, 7: POTHOLE_DEEP}
+# RDD2022ES splits potholes into a shallow and a deep tier, but the deep tier holds
+# only ~270 boxes dataset-wide and lands ~11 in a validation split, too few to learn
+# from or to measure. Both tiers collapse into one class and severity comes from box
+# geometry in the app instead.
+RDD_REMAP = {6: POTHOLE, 7: POTHOLE}
 MANHOLE_REMAP = {2: MANHOLE}
 MANHOLE_SOURCE_POTHOLE = 0
 
@@ -229,7 +233,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--countries", nargs="*", default=None,
                         help="filename prefixes to keep, e.g. United_States Czech")
-    parser.add_argument("--background-frac", type=float, default=0.1,
+    parser.add_argument("--background-frac", type=float, default=0.3,
                         help="share of final training images that carry no boxes")
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
@@ -246,8 +250,10 @@ def main():
     labelled = [r for r in rdd if r[1]]
     background = [r for r in rdd if not r[1]]
 
-    # Backgrounds suppress false positives, but RDD is mostly empty frames and
-    # letting them dominate teaches the model that predicting nothing is safe.
+    # Most of what is left after dropping cracks is a frame holding a crack and no
+    # pothole, which is the single most useful negative there is: cracks are what a
+    # pothole detector false-positives on. Worth a healthy share, but letting them
+    # dominate would teach the model that predicting nothing is safe.
     budget = int(len(labelled) * args.background_frac / max(1e-9, 1 - args.background_frac))
     random.Random(args.seed).shuffle(background)
     background = background[:budget]
