@@ -26,6 +26,29 @@ MANHOLE_SOURCE_POTHOLE = 0
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 
+def resolve_root(requested, marker, search=Path("/kaggle/input")):
+    """Locate a dataset directory when the mount name differs from what we assumed.
+
+    Kaggle names each mount after the dataset slug, which does not always match what
+    a notebook was written against. Rather than fail on a hardcoded guess, look for
+    the directory by a marker we know it contains, and say what was actually there
+    when that fails too.
+    """
+    if requested.is_dir():
+        return requested
+
+    candidates = sorted(search.glob(marker)) if search.is_dir() else []
+    if len(candidates) == 1:
+        print(f"{requested} missing, resolved to {candidates[0]}")
+        return candidates[0]
+
+    listing = sorted(p.name for p in search.iterdir()) if search.is_dir() else []
+    raise SystemExit(
+        f"{requested} not found and {marker!r} matched {len(candidates)} directories "
+        f"{[str(c) for c in candidates]}. Contents of {search}: {listing}"
+    )
+
+
 def thumbnails(paths, size=16):
     """Contrast-normalised grayscale thumbnails, so JPEG quality differences wash out.
 
@@ -95,6 +118,7 @@ def country_of(path):
 
 
 def load_rdd(root, countries, keep_mirrors, mirror_threshold):
+    root = resolve_root(root, "*/combined_annotatedv2")
     images = sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
     if not images:
         raise SystemExit(f"no images found under {root}")
@@ -125,6 +149,8 @@ def load_manhole(root):
     our two tiers, and keeping the frame with the pothole unmarked would train the
     model to read a real pothole as background.
     """
+    root = resolve_root(root, "*manhole*")
+
     images = {}
     for path in sorted(root.rglob("*")):
         if path.suffix.lower() in IMAGE_EXTS:
