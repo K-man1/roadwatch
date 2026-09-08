@@ -26,26 +26,32 @@ MANHOLE_SOURCE_POTHOLE = 0
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 
-def resolve_root(requested, marker, search=Path("/kaggle/input")):
-    """Locate a dataset directory when the mount name differs from what we assumed.
+def resolve_root(requested, marker, search=Path("/kaggle/input"), max_depth=5):
+    """Locate a dataset directory when the mount path differs from what we assumed.
 
-    Kaggle names each mount after the dataset slug, which does not always match what
-    a notebook was written against. Rather than fail on a hardcoded guess, look for
-    the directory by a marker we know it contains, and say what was actually there
-    when that fails too.
+    Kaggle has more than one mount layout and a notebook cannot know which one it will
+    be handed, so look the directory up by a marker it contains rather than trusting a
+    hardcoded path. Search by increasing depth instead of a recursive glob: these
+    mounts hold tens of thousands of files and "**" would walk every one of them.
     """
     if requested.is_dir():
         return requested
+    if not search.is_dir():
+        raise SystemExit(f"{requested} not found and {search} does not exist")
 
-    candidates = sorted(search.glob(marker)) if search.is_dir() else []
-    if len(candidates) == 1:
-        print(f"{requested} missing, resolved to {candidates[0]}")
-        return candidates[0]
+    for depth in range(max_depth):
+        pattern = "/".join(["*"] * depth + [marker])
+        found = [p for p in search.glob(pattern) if p.is_dir()]
+        if len(found) == 1:
+            print(f"{requested} missing, resolved to {found[0]}")
+            return found[0]
+        if found:
+            raise SystemExit(f"{marker!r} is ambiguous under {search}: {[str(p) for p in found]}")
 
-    listing = sorted(p.name for p in search.iterdir()) if search.is_dir() else []
+    seen = sorted(str(p.relative_to(search)) for p in search.glob("*/*/*") if p.is_dir())
     raise SystemExit(
-        f"{requested} not found and {marker!r} matched {len(candidates)} directories "
-        f"{[str(c) for c in candidates]}. Contents of {search}: {listing}"
+        f"{requested} not found and nothing matched {marker!r} under {search}. "
+        f"Directories three levels down: {seen[:40]}"
     )
 
 
@@ -118,7 +124,7 @@ def country_of(path):
 
 
 def load_rdd(root, countries, keep_mirrors, mirror_threshold):
-    root = resolve_root(root, "*/combined_annotatedv2")
+    root = resolve_root(root, "combined_annotatedv2")
     images = sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
     if not images:
         raise SystemExit(f"no images found under {root}")
