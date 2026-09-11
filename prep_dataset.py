@@ -2,7 +2,7 @@
 """Build a YOLO detection dataset for RoadWatch out of RDD2022ES plus a manhole source.
 
 RDD2022ES ships as one flat directory of images and YOLO .txt files covering eight
-severity-split damage classes. We keep the two pothole tiers, fold in manhole boxes
+severity-split damage classes. We fold those into pothole and crack, add manhole boxes
 from a second dataset so the model learns to leave storm drains alone, and emit the
 train/val/test layout Ultralytics expects.
 """
@@ -17,16 +17,18 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-CLASS_NAMES = ["pothole", "manhole"]
-POTHOLE, MANHOLE = 0, 1
+CLASS_NAMES = ["pothole", "manhole", "crack"]
+POTHOLE, MANHOLE, CRACK = 0, 1, 2
 
-# RDD2022ES splits potholes into a shallow and a deep tier, but the deep tier holds
-# only ~270 boxes dataset-wide and lands ~11 in a validation split, too few to learn
-# from or to measure. Both tiers collapse into one class and severity comes from box
-# geometry in the app instead.
-RDD_REMAP = {6: POTHOLE, 7: POTHOLE}
+# RDD2022ES gives every damage type two severity tiers; per its data card the IDs are
+# 0/1 longitudinal crack, 2/3 transverse, 4/5 alligator, 6/7 pothole. The deep pothole
+# tier holds only ~270 boxes dataset-wide and lands ~11 in a validation split, too few
+# to learn from or to measure, so tiers collapse and severity comes from box geometry
+# in the app instead. The crack types share one class as well: the app has to tell a
+# crack from a pothole, not a longitudinal crack from a transverse one.
+RDD_REMAP = {0: CRACK, 1: CRACK, 2: CRACK, 3: CRACK, 4: CRACK, 5: CRACK, 6: POTHOLE, 7: POTHOLE}
 MANHOLE_REMAP = {2: MANHOLE}
-MANHOLE_SOURCE_POTHOLE = 0
+MANHOLE_SOURCE_DAMAGE = {0, 1}
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -148,27 +150,24 @@ def load_rdd(root, countries, keep_mirrors, mirror_threshold):
         images, dropped = drop_mirrors(images, mirror_threshold)
     print(f"RDD: {len(images)} images kept, {dropped} mirrored duplicates dropped")
 
-    # Everything outside RDD_REMAP is currently discarded, which leaves crack frames as
-    # unlabelled background. Real dashcam footage shows the model firing on sealed cracks,
-    # so the crack tiers are the obvious next class to promote; this histogram is what
-    # says which source indices they are, since the tier layout is not documented.
+    # remap_lines silently drops any ID outside RDD_REMAP, so this histogram is what would
+    # show an ID the data card does not list.
     seen = Counter()
     records = [(p, remap_lines(p.with_suffix(".txt"), RDD_REMAP, seen)) for p in images]
-    print(f"RDD source classes: {dict(sorted(seen.items()))}, "
-          f"kept as pothole: {sorted(RDD_REMAP)}")
+    print(f"RDD source classes: {dict(sorted(seen.items()))}")
     return records
 
 
 def load_manhole(root):
-    """Collect manhole boxes, keeping only frames that contain no pothole.
+    """Collect manhole boxes, keeping only frames that contain no road damage.
 
     This dataset ships the same images under all_classes/ and under per-class
     folders, so one stem can carry two label files holding different subsets of the
     truth; taking the union of their lines is correct whichever layout we walk into.
-    Frames that also hold a pothole are dropped rather than partially labelled. The
-    source has no severity annotation so its potholes cannot be placed in either of
-    our two tiers, and keeping the frame with the pothole unmarked would train the
-    model to read a real pothole as background.
+    Frames that also hold a pothole or crack are dropped rather than remapped. The
+    source is augmented, non-dashcam imagery that is only here to teach manhole, and
+    keeping the frame with its damage unmarked would train the model to read real
+    damage as background.
     """
     root = resolve_root(root, "*manhole*")
 
@@ -188,7 +187,7 @@ def load_manhole(root):
             if not parts:
                 continue
             source_class = int(float(parts[0]))
-            if source_class == MANHOLE_SOURCE_POTHOLE:
+            if source_class in MANHOLE_SOURCE_DAMAGE:
                 contaminated.add(stem)
             elif source_class in MANHOLE_REMAP:
                 boxes[stem].add(" ".join([str(MANHOLE_REMAP[source_class])] + parts[1:]))
@@ -196,7 +195,7 @@ def load_manhole(root):
     records = [(images[stem], sorted(lines)) for stem, lines in sorted(boxes.items())
                if lines and stem not in contaminated]
     skipped = len([s for s in boxes if s in contaminated])
-    print(f"manhole: {len(records)} images kept, {skipped} skipped for holding unlabelled potholes")
+    print(f"manhole: {len(records)} images kept, {skipped} skipped for holding unlabelled damage")
     return records
 
 
@@ -315,10 +314,9 @@ def main():
     labelled = [r for r in rdd if r[1]]
     background = [r for r in rdd if not r[1]]
 
-    # Most of what is left after dropping cracks is a frame holding a crack and no
-    # pothole, which is the single most useful negative there is: cracks are what a
-    # pothole detector false-positives on. Worth a healthy share, but letting them
-    # dominate would teach the model that predicting nothing is safe.
+    # With cracks labelled, background means a frame holding no damage at all. Worth a
+    # share so plain road stays quiet, but letting it dominate would teach the model
+    # that predicting nothing is safe.
     budget = int(len(labelled) * args.background_frac / max(1e-9, 1 - args.background_frac))
     random.Random(args.seed).shuffle(background)
     background = background[:budget]
