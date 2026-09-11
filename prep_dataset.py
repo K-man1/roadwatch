@@ -8,6 +8,7 @@ train/val/test layout Ultralytics expects.
 """
 
 import argparse
+import csv
 import os
 import random
 from collections import Counter, defaultdict
@@ -108,7 +109,7 @@ def drop_mirrors(paths, threshold=0.85, chunk=512):
     return [p for i, p in enumerate(paths) if i not in dropped], len(dropped)
 
 
-def remap_lines(label_path, table):
+def remap_lines(label_path, table, seen=None):
     if not label_path.exists():
         return []
     lines = []
@@ -117,6 +118,8 @@ def remap_lines(label_path, table):
         if not parts:
             continue
         source_class = int(float(parts[0]))
+        if seen is not None:
+            seen[source_class] += 1
         if source_class in table:
             lines.append(" ".join([str(table[source_class])] + parts[1:]))
     return lines
@@ -145,7 +148,15 @@ def load_rdd(root, countries, keep_mirrors, mirror_threshold):
         images, dropped = drop_mirrors(images, mirror_threshold)
     print(f"RDD: {len(images)} images kept, {dropped} mirrored duplicates dropped")
 
-    return [(p, remap_lines(p.with_suffix(".txt"), RDD_REMAP)) for p in images]
+    # Everything outside RDD_REMAP is currently discarded, which leaves crack frames as
+    # unlabelled background. Real dashcam footage shows the model firing on sealed cracks,
+    # so the crack tiers are the obvious next class to promote; this histogram is what
+    # says which source indices they are, since the tier layout is not documented.
+    seen = Counter()
+    records = [(p, remap_lines(p.with_suffix(".txt"), RDD_REMAP, seen)) for p in images]
+    print(f"RDD source classes: {dict(sorted(seen.items()))}, "
+          f"kept as pothole: {sorted(RDD_REMAP)}")
+    return records
 
 
 def load_manhole(root):
@@ -186,6 +197,57 @@ def load_manhole(root):
                if lines and stem not in contaminated]
     skipped = len([s for s in boxes if s in contaminated])
     print(f"manhole: {len(records)} images kept, {skipped} skipped for holding unlabelled potholes")
+    return records
+
+
+def load_negatives(root):
+    """Frames a detector already fired on wrongly, labelled from a sorted review.
+
+    These are worth more than ordinary background because the model has proven it
+    cannot handle them. predict_video.py writes one review crop per detection and the
+    sort is the allowlist: a crop moved into review/manhole becomes a manhole box from
+    the model's own coordinates, a crop moved into review/background contributes
+    nothing. A frame is only safe if every crop it produced was sorted. Anything left in
+    review/ is road damage or unreviewed, and damage left unlabelled trains the model
+    to suppress it.
+    """
+    root = resolve_root(root, root.name)
+    manifest = root / "manifest.csv"
+    if not manifest.exists():
+        raise SystemExit(f"{manifest} not found; --negatives wants a "
+                         "predict_video.py --save-negatives directory")
+
+    detections = defaultdict(list)
+    with open(manifest) as handle:
+        reader = csv.DictReader(handle)
+        if "crop" not in reader.fieldnames:
+            raise SystemExit(f"{manifest} has no box columns, so its manhole crops cannot "
+                             "become labels; re-run predict_video.py --save-negatives")
+        for row in reader:
+            detections[int(row["frame"])].append(row)
+
+    review = root / "review"
+    records, manholes, unsorted, missing = [], 0, 0, 0
+    for frame, dets in sorted(detections.items()):
+        lines, safe = [], True
+        for d in dets:
+            if (review / "manhole" / d["crop"]).exists():
+                lines.append(f"{MANHOLE} {d['x_center']} {d['y_center']} {d['w']} {d['h']}")
+            elif not (review / "background" / d["crop"]).exists():
+                safe = False
+        if not safe:
+            unsorted += 1
+            continue
+        # Checked after the sort so an upload can carry only the frames that survived it.
+        image = root / "images" / f"frame_{frame:06d}.jpg"
+        if not image.exists():
+            missing += 1
+            continue
+        records.append((image, lines))
+        manholes += len(lines)
+
+    print(f"negatives {root.name}: {len(records)} frames kept, {manholes} manhole boxes, "
+          f"{unsorted} dropped for an unsorted crop, {missing} images missing")
     return records
 
 
@@ -231,6 +293,9 @@ def main():
     parser.add_argument("--manhole", type=Path,
                         help="root of sabidrahman/pothole-cracks-and-openmanhole")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--negatives", type=Path, nargs="+", default=[],
+                        help="sorted predict_video.py --save-negatives directories of dashcam "
+                             "frames the model false-fired on; added to train only")
     parser.add_argument("--countries", nargs="*", default=None,
                         help="filename prefixes to keep, e.g. United_States Czech")
     parser.add_argument("--background-frac", type=float, default=0.3,
@@ -262,6 +327,7 @@ def main():
     sources = [("rdd_", labelled + background)]
     if args.manhole:
         sources.append(("mh_", load_manhole(args.manhole)))
+    negatives = [(root, load_negatives(root)) for root in args.negatives]
 
     if args.out.exists():
         raise SystemExit(f"{args.out} already exists, remove it first")
@@ -270,6 +336,14 @@ def main():
     for prefix, records in sources:
         for name, chunk in split(records, args.val_frac, args.test_frac, args.seed).items():
             totals[name] += write_split(args.out, name, chunk, prefix, args.copy)
+
+    # Harvested negatives go to train only. They exist to teach, and holding val and test
+    # identical to the previous build is what makes the retrained numbers comparable to
+    # the run this is trying to improve on.
+    # Every harvest names its frames frame_NNNNNN, so the directory name is what keeps
+    # two clips from overwriting each other's labels.
+    for root, records in negatives:
+        totals["train"] += write_split(args.out, "train", records, f"neg_{root.name}_", args.copy)
 
     names = "\n".join(f"  {i}: {n}" for i, n in enumerate(CLASS_NAMES))
     (args.out / "data.yaml").write_text(
